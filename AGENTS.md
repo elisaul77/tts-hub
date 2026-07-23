@@ -58,7 +58,7 @@ flowchart TB
 |---|---|---|
 | ⚠️ `gateway/main.py` | ~772 | Every route, every engine adapter, all WAV handling and the LLM bridge live here. Every other component depends on its HTTP contract. Touching it can break all five services at once. |
 | ⚠️ `docker-compose.yml` | ~129 | Wires all services, ports, env vars, GPU reservation and healthchecks. A bad edit takes the whole stack down. |
-| ⚠️ `gateway/static/index.html` | ~401 | Single-file UI consuming every gateway endpoint. No build step, no framework — a JS error blanks the page silently. |
+| ⚠️ `gateway/static/index.html` | ~890 | Single-file UI (design-system CSS + markup + JS) consuming every gateway endpoint. No build step, no framework — a JS error blanks the page silently. The `<script>` block is the DOM contract; changing element ids/classes breaks the wiring. |
 
 **Rule**: never refactor `gateway/main.py` wholesale. Edit the named function only.
 

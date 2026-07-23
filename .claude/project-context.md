@@ -38,7 +38,7 @@ generates) and `GET /api/speak/file/{job_id}` (assembled download). See
   every service, the UI, and all external API consumers.
 - `docker-compose.yml` — ~129 lines — wires all 5 services, ports, env vars,
   GPU reservation, healthchecks. Changes impact: the entire stack.
-- `gateway/static/index.html` — ~401 lines — single-file UI (markup + CSS + JS)
+- `gateway/static/index.html` — ~890 lines — single-file UI (design-system CSS + markup + JS)
   consuming every gateway endpoint. No build step, no framework; a JS error
   blanks the page with no console trace for the user.
 
