@@ -12,12 +12,13 @@ Escribes, eliges el motor, escuchas. Sin API keys, sin nube, sin telemetría.
 
 | Motor | Modelo | Dispositivo | Español | Velocidad medida | Fuerte en |
 |---|---|---|---|---|---|
-| **PocketTTS** | [Kyutai Pocket TTS](https://github.com/kyutai-labs/pocket-tts) 100M | CPU | Nativo (voz `lola`) | **~3× tiempo real** | Latencia mínima, streaming |
-| **Kokoro** | [Kokoro-82M](https://github.com/remsky/Kokoro-FastAPI) | CPU | `ef_dora`, `em_alex`, `em_santa` | **~3.4× tiempo real** | 68 voces, 8 idiomas |
-| **Chatterbox** | [Resemble AI](https://github.com/travisvn/chatterbox-tts-api) 0.5B | GPU | 22 idiomas | depende de la GPU | Máxima calidad, clonación de voz |
+| **PocketTTS** | [Kyutai Pocket TTS](https://github.com/kyutai-labs/pocket-tts) 100M | CPU | Nativo (voces `lola`, `rafael`) | **3.0× tiempo real** | Latencia mínima, streaming |
+| **Kokoro** | [Kokoro-82M](https://github.com/remsky/Kokoro-FastAPI) | CPU | `ef_dora`, `em_alex`, `em_santa` | **4.1× tiempo real** | 68 voces, 8 idiomas |
+| **Chatterbox** | [Resemble AI](https://github.com/travisvn/chatterbox-tts-api) 0.5B | GPU | 22 idiomas | **1.3× tiempo real** | Máxima calidad, clonación de voz |
 
-> Medido en un Ryzen de 16 hilos con 4 hilos asignados al contenedor, frase de
-> ~5 s de audio. Los dos motores de CPU dejan la GPU entera libre para tu LLM.
+> Medido en una misma frase de ~4 s: CPU de 16 hilos (4 asignados al contenedor
+> de PocketTTS) y GPU RTX 3050 de 6 GB para Chatterbox. Los dos motores de CPU
+> dejan la GPU entera libre para tu LLM.
 
 ---
 
@@ -64,8 +65,11 @@ CHATTERBOX_DEVICE=cpu
 - **Selector de voz** que se repuebla al cambiar de motor y **preselecciona la
   voz española** si el motor tiene una.
 - **Velocidad** (solo Kokoro, el único que la expone).
-- **Streaming** para PocketTTS y Chatterbox: el audio empieza a sonar antes de
-  terminar de generarse.
+- **Streaming**: el audio empieza a sonar antes de terminar de generarse. La
+  casilla se activa sola en los motores que lo soportan — el gateway lo
+  averigua leyendo el `openapi.json` de cada uno, así que acierta aunque
+  cambies de versión de imagen. Hoy: PocketTTS sí; Kokoro no; Chatterbox
+  depende del tag (el `gpu` actual, no).
 - Reproductor con descarga del `.wav` y el tiempo real de generación.
 
 ---
@@ -130,18 +134,26 @@ Idiomas de PocketTTS: `english`, `german`, `italian`, `portuguese`, `spanish`
 
 ## Clonación de voz
 
-Chatterbox clona una voz a partir de 10–30 s de audio:
+Chatterbox clona una voz a partir de 10–30 s de audio. En cualquier versión
+funciona la clonación de un solo uso, subiendo la muestra con el texto:
+
+```bash
+curl -X POST http://localhost:4123/v1/audio/speech/upload \
+  -F "input=Hola, esta es mi voz clonada." \
+  -F "voice_file=@mi_voz.wav" \
+  --output clonada.wav
+```
+
+Las versiones recientes añaden además una biblioteca de voces con nombre:
 
 ```bash
 curl -X POST http://localhost:4123/voices \
-  -F "voice_file=@mi_voz.wav" \
-  -F "voice_name=mi-voz" \
-  -F "language=es"
+  -F "voice_file=@mi_voz.wav" -F "voice_name=mi-voz" -F "language=es"
 ```
 
-La voz aparece en el desplegable del hub tras recargar la página. Chatterbox
-detecta el idioma a partir de los metadatos de la voz, así que la etiqueta
-`language=es` importa.
+Si tu imagen la trae, la voz aparece en el desplegable del hub al recargar; si
+no, el endpoint responde 404 y el hub simplemente ofrece la voz `default`.
+Comprueba qué soporta tu imagen con `curl http://localhost:4123/openapi.json`.
 
 PocketTTS también clona (`get_state_for_audio_prompt` acepta un `.wav`), pero
 el repositorio de pesos con clonación está restringido en Hugging Face; el
@@ -177,6 +189,9 @@ Dos detalles que resuelve el gateway y que no son obvios:
    (tamaños `0xFFFFFFFF`), y el navegador reporta una duración de ~89 000 s y no
    deja buscar. El gateway reescribe los tamaños del RIFF cuando ya tiene el
    archivo entero.
+3. **Las capacidades se detectan, no se dan por supuestas.** Antes de pedir
+   streaming, el gateway mira el `openapi.json` del motor; si no existe la ruta,
+   cae a la petición normal en vez de devolver un 404.
 
 ---
 

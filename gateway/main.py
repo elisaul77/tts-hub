@@ -102,9 +102,16 @@ async def _voices_kokoro(client: httpx.AsyncClient, base: str) -> list[dict]:
 
 
 async def _voices_chatterbox(client: httpx.AsyncClient, base: str) -> list[dict]:
-    data = (await client.get(f"{base}/voices", timeout=10.0)).json()
-    raw = data.get("voices", data if isinstance(data, list) else [])
+    # The built-in sample is always there. The named voice library only exists
+    # in newer builds, so treat it as a bonus rather than a requirement.
     out = [{"id": "default", "language": "auto"}]
+    try:
+        response = await client.get(f"{base}/voices", timeout=10.0)
+        response.raise_for_status()
+        data = response.json()
+    except Exception:
+        return out
+    raw = data.get("voices", data if isinstance(data, list) else [])
     for item in raw:
         if isinstance(item, str):
             out.append({"id": item, "language": "auto"})
@@ -163,10 +170,21 @@ def _fix_wav_sizes(data: bytes) -> bytes:
     return data
 
 
-def _path(engine: str, stream: bool) -> str:
-    if stream and ENGINES[engine]["streaming"]:
-        return "/v1/audio/speech/stream"
-    return "/v1/audio/speech"
+STREAM_PATH = "/v1/audio/speech/stream"
+
+
+async def _supports_streaming(client: httpx.AsyncClient, base: str, fallback: bool) -> bool:
+    """Ask the engine itself instead of trusting a hardcoded flag.
+
+    Chatterbox only grew a streaming endpoint in recent builds, so which image
+    tag you happen to be running decides the answer.
+    """
+    try:
+        response = await client.get(f"{base}/openapi.json", timeout=8.0)
+        response.raise_for_status()
+        return STREAM_PATH in response.json().get("paths", {})
+    except Exception:
+        return fallback
 
 
 # --------------------------------------------------------------------------
@@ -181,13 +199,20 @@ async def list_engines():
         async def probe(key: str, cfg: dict) -> dict:
             entry = {k: v for k, v in cfg.items() if k != "url"}
             entry["id"] = key
+            base = cfg["url"]
             try:
-                entry["voices"] = await VOICE_LOADERS[key](client, cfg["url"])
-                entry["status"] = "online"
+                response = await client.get(f"{base}/health", timeout=8.0)
+                response.raise_for_status()
             except Exception as exc:
+                entry.update(status="offline", error=str(exc), voices=[], streaming=False)
+                return entry
+            entry["status"] = "online"
+            entry["streaming"] = await _supports_streaming(client, base, cfg["streaming"])
+            try:
+                entry["voices"] = await VOICE_LOADERS[key](client, base)
+            except Exception as exc:
+                log.warning("Could not list %s voices: %s", key, exc)
                 entry["voices"] = []
-                entry["status"] = "offline"
-                entry["error"] = str(exc)
             return entry
 
         return await asyncio.gather(*(probe(k, v) for k, v in ENGINES.items()))
@@ -199,11 +224,16 @@ async def speak(req: SpeakRequest):
     if cfg is None:
         raise HTTPException(400, f"Unknown engine: {req.engine}")
 
-    url = cfg["url"] + _path(req.engine, req.stream)
+    streaming = False
+    if req.stream:
+        async with httpx.AsyncClient() as probe_client:
+            streaming = await _supports_streaming(probe_client, cfg["url"], cfg["streaming"])
+
+    url = cfg["url"] + (STREAM_PATH if streaming else "/v1/audio/speech")
     body = _payload(req.engine, req)
     started = time.perf_counter()
 
-    if req.stream and cfg["streaming"]:
+    if streaming:
         client = httpx.AsyncClient(timeout=TIMEOUT)
         request = client.build_request("POST", url, json=body)
         try:

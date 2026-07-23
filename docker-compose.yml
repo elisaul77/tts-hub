@@ -72,6 +72,14 @@ services:
     volumes:
       - chatterbox-models:/cache
       - chatterbox-voices:/voices
+    # The image bakes in a healthcheck hardcoded to port 5123, which reports
+    # "unhealthy" forever when the service listens on 4123.
+    healthcheck:
+      test: ["CMD-SHELL", "curl -fs http://localhost:4123/health || exit 1"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 300s
     deploy:
       resources:
         reservations:
