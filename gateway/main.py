@@ -7,13 +7,14 @@ Normalises three different local TTS APIs behind a single contract so the UI
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
 import os
 import time
 from pathlib import Path
 
 import httpx
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, File, Form, HTTPException, UploadFile
 from fastapi.responses import FileResponse, Response, StreamingResponse
 from pydantic import BaseModel, Field
 
@@ -25,6 +26,19 @@ STATIC = Path(__file__).parent / "static"
 POCKET_URL = os.getenv("POCKET_URL", "http://pocket:8000")
 KOKORO_URL = os.getenv("KOKORO_URL", "http://kokoro:8880")
 CHATTERBOX_URL = os.getenv("CHATTERBOX_URL", "http://chatterbox:4123")
+STT_URL = os.getenv("STT_URL", "http://stt:8000")
+
+# Any OpenAI-compatible server: LM Studio (1234), Ollama (11434), llama.cpp...
+LLM_URL = os.getenv("LLM_URL", "http://host.docker.internal:1234/v1")
+LLM_MODEL = os.getenv("LLM_MODEL", "")
+LLM_API_KEY = os.getenv("LLM_API_KEY", "not-needed")
+SYSTEM_PROMPT = os.getenv(
+    "SYSTEM_PROMPT",
+    "Eres un asistente de voz. Responde en español, de forma breve y natural, "
+    "como en una conversación hablada. Tu respuesta se va a leer en voz alta, "
+    "así que nunca uses markdown, listas ni emojis, y escribe las cifras con "
+    "palabras (trescientos mil, no 300.000).",
+)
 
 # Generation on CPU can be slow for long text; be generous.
 TIMEOUT = httpx.Timeout(connect=5.0, read=600.0, write=30.0, pool=5.0)
@@ -276,6 +290,164 @@ async def speak(req: SpeakRequest):
         media_type="audio/wav",
         headers={"X-Generation-Seconds": f"{elapsed:.2f}"},
     )
+
+
+# --------------------------------------------------------------------------
+# Conversation loop: microphone -> STT -> LLM -> TTS
+# --------------------------------------------------------------------------
+
+
+class Message(BaseModel):
+    role: str
+    content: str
+
+
+class ChatRequest(BaseModel):
+    messages: list[Message]
+
+
+async def _resolve_llm_model(client: httpx.AsyncClient) -> str:
+    """Use whatever model the server has loaded unless one was configured.
+
+    LM Studio serves a single loaded model but still wants the field populated;
+    asking it beats hardcoding a name that changes every time you swap models.
+    """
+    if LLM_MODEL:
+        return LLM_MODEL
+    try:
+        response = await client.get(
+            f"{LLM_URL}/models",
+            headers={"Authorization": f"Bearer {LLM_API_KEY}"},
+            timeout=10.0,
+        )
+        response.raise_for_status()
+        data = response.json().get("data", [])
+        if data:
+            return data[0].get("id", "local-model")
+    except Exception as exc:
+        log.warning("Could not list LLM models: %s", exc)
+    return "local-model"
+
+
+async def _transcribe(audio: bytes, filename: str, language: str | None) -> dict:
+    files = {"file": (filename or "audio.webm", audio, "application/octet-stream")}
+    data = {"language": language} if language else {}
+    async with httpx.AsyncClient(timeout=TIMEOUT) as client:
+        try:
+            response = await client.post(
+                f"{STT_URL}/v1/audio/transcriptions", files=files, data=data
+            )
+        except Exception as exc:
+            raise HTTPException(502, f"STT unreachable: {exc}") from exc
+    if response.status_code >= 400:
+        raise HTTPException(response.status_code, f"STT: {response.text[:500]}")
+    return response.json()
+
+
+async def _complete(messages: list[dict]) -> str:
+    async with httpx.AsyncClient(timeout=TIMEOUT) as client:
+        model = await _resolve_llm_model(client)
+        body = {
+            "model": model,
+            "messages": [{"role": "system", "content": SYSTEM_PROMPT}] + messages,
+            "temperature": 0.7,
+        }
+        try:
+            response = await client.post(
+                f"{LLM_URL}/chat/completions",
+                json=body,
+                headers={"Authorization": f"Bearer {LLM_API_KEY}"},
+            )
+        except Exception as exc:
+            raise HTTPException(
+                502,
+                f"LLM unreachable at {LLM_URL}. Is LM Studio serving on the "
+                f"local network? ({exc})",
+            ) from exc
+    if response.status_code >= 400:
+        raise HTTPException(response.status_code, f"LLM: {response.text[:500]}")
+    return response.json()["choices"][0]["message"]["content"].strip()
+
+
+@app.post("/api/transcribe")
+async def transcribe(file: UploadFile = File(...), language: str | None = Form(None)):
+    return await _transcribe(await file.read(), file.filename or "audio.webm", language)
+
+
+@app.post("/api/chat")
+async def chat(req: ChatRequest):
+    reply = await _complete([m.model_dump() for m in req.messages])
+    return {"reply": reply}
+
+
+@app.post("/api/converse")
+async def converse(
+    file: UploadFile = File(...),
+    history: str = Form("[]"),
+    language: str | None = Form(None),
+):
+    """One turn: audio in, transcript and reply text out.
+
+    The reply is not synthesised here — the client posts it to /api/speak with
+    whichever engine and voice it has selected, and gets to show the text while
+    the audio is still generating.
+    """
+    started = time.perf_counter()
+    heard = await _transcribe(await file.read(), file.filename or "audio.webm", language)
+    user_text = heard.get("text", "").strip()
+    if not user_text:
+        raise HTTPException(422, "No se entendió nada en el audio")
+
+    try:
+        messages = json.loads(history)
+        if not isinstance(messages, list):
+            raise ValueError
+    except Exception:
+        messages = []
+    messages.append({"role": "user", "content": user_text})
+
+    reply = await _complete(messages)
+    log.info("Turn completed in %.2fs", time.perf_counter() - started)
+    return {"user_text": user_text, "reply_text": reply}
+
+
+@app.get("/api/services")
+async def services():
+    """Status of the two pieces the conversation loop needs beyond TTS."""
+
+    async def probe_stt(client: httpx.AsyncClient) -> dict:
+        try:
+            response = await client.get(f"{STT_URL}/health", timeout=8.0)
+            response.raise_for_status()
+            # status last: the engine reports its own "ok", which would
+            # otherwise overwrite the value the UI checks for.
+            return {**response.json(), "status": "online"}
+        except Exception as exc:
+            return {"status": "offline", "error": str(exc)}
+
+    async def probe_llm(client: httpx.AsyncClient) -> dict:
+        # _resolve_llm_model falls back to a placeholder name, so it cannot tell
+        # us whether the server is up. Hit /models directly.
+        try:
+            response = await client.get(
+                f"{LLM_URL}/models",
+                headers={"Authorization": f"Bearer {LLM_API_KEY}"},
+                timeout=8.0,
+            )
+            response.raise_for_status()
+            data = response.json().get("data", [])
+        except Exception as exc:
+            return {"status": "offline", "url": LLM_URL, "error": str(exc)}
+        return {
+            "status": "online",
+            "url": LLM_URL,
+            "model": LLM_MODEL or (data[0].get("id") if data else "local-model"),
+            "available": [m.get("id") for m in data][:20],
+        }
+
+    async with httpx.AsyncClient() as client:
+        stt, llm = await asyncio.gather(probe_stt(client), probe_llm(client))
+    return {"stt": stt, "llm": llm}
 
 
 @app.get("/health")

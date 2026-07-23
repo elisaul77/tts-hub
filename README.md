@@ -3,6 +3,9 @@
 Tres motores de texto a voz **100 % locales** detrás de una sola caja de texto.
 Escribes, eliges el motor, escuchas. Sin API keys, sin nube, sin telemetría.
 
+Y una segunda pestaña para **hablar** con tu LLM local: micrófono → Whisper →
+LM Studio (u Ollama) → voz, sin que ningún audio salga de la máquina.
+
 ![stack](https://img.shields.io/badge/docker-compose-2496ED?logo=docker&logoColor=white)
 ![license](https://img.shields.io/badge/license-MIT-green)
 
@@ -19,6 +22,12 @@ Escribes, eliges el motor, escuchas. Sin API keys, sin nube, sin telemetría.
 > Medido en una misma frase de ~4 s: CPU de 16 hilos (4 asignados al contenedor
 > de PocketTTS) y GPU RTX 3050 de 6 GB para Chatterbox. Los dos motores de CPU
 > dejan la GPU entera libre para tu LLM.
+
+Más un cuarto servicio para la escucha:
+
+| Servicio | Modelo | Dispositivo | Velocidad medida |
+|---|---|---|---|
+| **STT** | [faster-whisper](https://github.com/SYSTRAN/faster-whisper) `small` int8 | CPU | 2.3× tiempo real |
 
 ---
 
@@ -74,6 +83,57 @@ CHATTERBOX_DEVICE=cpu
 
 ---
 
+## Conversar con tu LLM
+
+La pestaña **Conversar** cierra el bucle: pulsas el micrófono, hablas, vuelves a
+pulsar y el asistente te contesta en voz alta. El historial se mantiene en el
+navegador (últimos 12 mensajes), así que el gateway no guarda nada.
+
+```
+micrófono ──► Whisper ──► LM Studio ──► motor TTS elegido ──► altavoz
+   (navegador)   (CPU)      (tu GPU)        (CPU o GPU)
+```
+
+### Conectar LM Studio
+
+En LM Studio: pestaña **Developer** → arranca el servidor → activa
+**«Serve on local network»**. Sin eso escucha solo en `127.0.0.1` y el
+contenedor no lo alcanza. Después:
+
+```ini
+LLM_URL=http://host.docker.internal:1234/v1
+LLM_MODEL=            # vacío = usa el modelo que tengas cargado
+```
+
+### Conectar Ollama
+
+```ini
+LLM_URL=http://host.docker.internal:11434/v1
+LLM_MODEL=qwen3.5-9b-q4_k_m:latest
+```
+
+Ollama también escucha solo en loopback por defecto; arráncalo con
+`OLLAMA_HOST=0.0.0.0`.
+
+La pestaña muestra el estado de Whisper y del LLM en vivo, y desactiva el
+micrófono si falta alguno. Comprobación rápida desde la terminal:
+
+```bash
+curl http://localhost:8600/api/services | jq
+```
+
+> El primer turno puede tardar bastante mientras el LLM carga el modelo en
+> memoria. En un turno ya caliente, con Whisper `small` en CPU y un modelo de
+> 4B, la vuelta completa desde que sueltas el micrófono ronda los 4 segundos.
+
+### Ajustar el asistente
+
+`SYSTEM_PROMPT` en `.env`. El de fábrica le pide respuestas breves, sin markdown
+ni emojis y con las cifras escritas en palabras — todo eso suena fatal leído en
+voz alta.
+
+---
+
 ## API
 
 El gateway habla un solo contrato, sin importar el motor que haya detrás.
@@ -105,9 +165,30 @@ Campos de `/api/speak`:
 | `speed` | float | `1.0` | solo Kokoro |
 | `stream` | bool | `false` | se ignora si el motor no lo soporta |
 
+Y para el bucle conversacional:
+
+```bash
+# Solo transcribir
+curl -X POST http://localhost:8600/api/transcribe -F "file=@audio.wav"
+
+# Solo el LLM
+curl -X POST http://localhost:8600/api/chat \
+  -H "Content-Type: application/json" \
+  -d '{"messages":[{"role":"user","content":"Hola"}]}'
+
+# Un turno entero: audio -> transcripción + respuesta
+curl -X POST http://localhost:8600/api/converse \
+  -F "file=@pregunta.wav" -F 'history=[]'
+```
+
+`/api/converse` devuelve `{"user_text": ..., "reply_text": ...}` y **no**
+sintetiza: el cliente manda ese texto a `/api/speak` con el motor y la voz que
+tenga elegidos, lo que permite mostrar la respuesta escrita mientras el audio
+todavía se está generando.
+
 Cada motor sigue accesible por su cuenta si prefieres su API nativa:
-PocketTTS en `:8601`, Kokoro en `:8880`, Chatterbox en `:4123`
-(este último trae su propio Swagger en `/docs`).
+PocketTTS en `:8601`, Whisper en `:8602`, Kokoro en `:8880`, Chatterbox en
+`:4123` (este último trae su propio Swagger en `/docs`).
 
 ---
 
@@ -165,20 +246,20 @@ predefinidas ya calculadas como *embeddings* (y carga mucho más rápido).
 ## Arquitectura
 
 ```
-                    ┌──────────────────────────┐
-   navegador  ────► │  gateway  :8600          │
-                    │  UI + normalización API  │
-                    └───┬────────┬─────────┬───┘
-                        │        │         │
-              ┌─────────▼──┐ ┌───▼─────┐ ┌─▼────────────┐
-              │ pocket     │ │ kokoro  │ │ chatterbox   │
-              │ :8000 CPU  │ │ :8880   │ │ :4123 GPU    │
-              │ (build)    │ │ (imagen)│ │ (imagen)     │
-              └────────────┘ └─────────┘ └──────────────┘
+                        ┌──────────────────────────┐
+       navegador  ────► │  gateway  :8600          │ ────► LM Studio / Ollama
+      (UI + micro)      │  UI + normalización API  │        (en el host)
+                        └──┬─────┬──────┬───────┬──┘
+                           │     │      │       │
+                 ┌─────────▼─┐ ┌─▼────┐ ┌▼─────────────┐ ┌▼──────────┐
+                 │ pocket    │ │kokoro│ │ chatterbox   │ │ stt       │
+                 │ :8000 CPU │ │:8880 │ │ :4123 GPU    │ │ :8000 CPU │
+                 │ (build)   │ │(img) │ │ (img)        │ │ (build)   │
+                 └───────────┘ └──────┘ └──────────────┘ └───────────┘
 ```
 
-`gateway/` y `engines/pocket/` se construyen desde este repo. Kokoro y
-Chatterbox usan imágenes publicadas por sus autores.
+`gateway/`, `engines/pocket/` y `engines/stt/` se construyen desde este repo.
+Kokoro y Chatterbox usan imágenes publicadas por sus autores.
 
 Dos detalles que resuelve el gateway y que no son obvios:
 
@@ -208,8 +289,21 @@ Si eso falla, el problema está en el toolkit del host, no aquí.
 **PocketTTS va lento.** Estás en `spanish_24l`. Cambia a `spanish` en `.env` y
 `docker compose up -d pocket`. Subir `POCKET_THREADS` no ayuda.
 
-**Puerto ocupado.** Cambia `GATEWAY_PORT`, `POCKET_PORT`, `KOKORO_PORT` o
-`CHATTERBOX_PORT` en `.env`.
+**Puerto ocupado.** Cambia `GATEWAY_PORT`, `POCKET_PORT`, `STT_PORT`,
+`KOKORO_PORT` o `CHATTERBOX_PORT` en `.env`.
+
+**El LLM sale «sin conexión».** Casi siempre es que el servidor escucha solo en
+`127.0.0.1`: activa «Serve on local network» en LM Studio o arranca Ollama con
+`OLLAMA_HOST=0.0.0.0`. Verifica con
+`docker compose exec gateway curl -s $LLM_URL/models`.
+
+**El micrófono no aparece.** El navegador solo da acceso en contexto seguro. En
+`http://localhost:8600` funciona; si abres el hub desde otra máquina por su IP
+necesitarás HTTPS o marcar el origen como fiable en el navegador.
+
+**Whisper transcribe mal.** Sube de `small` a `medium` en `STT_MODEL`, o fija
+`STT_LANGUAGE=es` si lo tenías en automático — con frases cortas la detección
+automática de idioma falla más de lo que parece.
 
 ---
 
@@ -222,6 +316,7 @@ Este código es MIT. Los modelos no:
 | Pocket TTS (pesos) | CC-BY-4.0 |
 | Kokoro-82M | Apache-2.0 |
 | Chatterbox | MIT |
+| faster-whisper / Whisper | MIT |
 
 Revisa la licencia de cada **voz** por separado antes de usarla comercialmente —
 en Kyutai están detalladas en [kyutai/tts-voices](https://huggingface.co/kyutai/tts-voices).
