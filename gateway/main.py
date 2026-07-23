@@ -7,10 +7,15 @@ Normalises three different local TTS APIs behind a single contract so the UI
 from __future__ import annotations
 
 import asyncio
+import io
 import json
 import logging
 import os
+import re
+import struct
 import time
+import uuid
+import wave
 from pathlib import Path
 
 import httpx
@@ -42,6 +47,16 @@ SYSTEM_PROMPT = os.getenv(
 
 # Generation on CPU can be slow for long text; be generous.
 TIMEOUT = httpx.Timeout(connect=5.0, read=600.0, write=30.0, pool=5.0)
+
+# Segment sizing. Below MIN a fragment carries too little context and the
+# engine flattens its intonation; above MAX you are back to waiting.
+SEGMENT_MIN_CHARS = int(os.getenv("SEGMENT_MIN_CHARS", "60"))
+SEGMENT_MAX_CHARS = int(os.getenv("SEGMENT_MAX_CHARS", "280"))
+# Breath between sentences, so they do not run into each other.
+SEGMENT_GAP_MS = int(os.getenv("SEGMENT_GAP_MS", "120"))
+# Streaming jobs kept in memory so the finished audio can be downloaded.
+JOB_TTL_SECONDS = 1800
+JOB_LIMIT = 20
 
 ENGINES = {
     "pocket": {
@@ -184,6 +199,111 @@ def _fix_wav_sizes(data: bytes) -> bytes:
     return data
 
 
+def _decode_wav(data: bytes) -> tuple[int, int, int, bytes]:
+    """Pull sample rate, channels, sample width and raw PCM out of a WAV."""
+    with wave.open(io.BytesIO(_fix_wav_sizes(data)), "rb") as wav:
+        return (
+            wav.getframerate(),
+            wav.getnchannels(),
+            wav.getsampwidth(),
+            wav.readframes(wav.getnframes()),
+        )
+
+
+def _parse_wav_header(data: bytes) -> tuple[int, int, int, int] | None:
+    """(sample_rate, channels, width, offset_of_pcm) or None if incomplete.
+
+    Works on a partial buffer, which is what lets us read the format off the
+    front of a streaming response before any audio has arrived.
+    """
+    if len(data) < 12 or data[:4] != b"RIFF" or data[8:12] != b"WAVE":
+        return None
+    offset, fmt = 12, None
+    while offset + 8 <= len(data):
+        chunk_id = data[offset : offset + 4]
+        size = int.from_bytes(data[offset + 4 : offset + 8], "little")
+        if chunk_id == b"fmt " and offset + 24 <= len(data):
+            channels, rate, _byte_rate, _align, bits = struct.unpack(
+                "<HIIHH", data[offset + 10 : offset + 24]
+            )
+            fmt = (rate, channels, bits // 8)
+        elif chunk_id == b"data":
+            return (*fmt, offset + 8) if fmt else None
+        offset += 8 + size + (size & 1)
+    return None
+
+
+def _open_wav_header(sample_rate: int, channels: int, width: int) -> bytes:
+    """RIFF header with placeholder sizes, for audio of unknown length."""
+    byte_rate = sample_rate * channels * width
+    return (
+        b"RIFF"
+        + struct.pack("<I", 0xFFFFFFFF)
+        + b"WAVEfmt "
+        + struct.pack(
+            "<IHHIIHH", 16, 1, channels, sample_rate, byte_rate, channels * width, width * 8
+        )
+        + b"data"
+        + struct.pack("<I", 0xFFFFFFFF - 36)
+    )
+
+
+_SPLIT_AT = re.compile(r"(?<=[.!?…:;])\s+|\n+")
+
+
+def split_text(
+    text: str,
+    min_chars: int = SEGMENT_MIN_CHARS,
+    max_chars: int = SEGMENT_MAX_CHARS,
+) -> list[str]:
+    """Cut text into chunks that can be synthesised one after another.
+
+    Sentence boundaries first, because that is where a pause already belongs.
+    Anything still too long gets broken on a comma (then on a space), and
+    anything too short is glued to the next piece — a three-word fragment on
+    its own comes out with clipped, unnatural intonation.
+    """
+    pieces: list[str] = []
+    for raw in _SPLIT_AT.split(text.strip()):
+        piece = raw.strip()
+        if not piece:
+            continue
+        while len(piece) > max_chars:
+            cut = piece.rfind(",", min_chars, max_chars)
+            if cut == -1:
+                cut = piece.rfind(" ", min_chars, max_chars)
+            if cut == -1:
+                cut = max_chars - 1
+            pieces.append(piece[: cut + 1].strip())
+            piece = piece[cut + 1 :].strip()
+        if piece:
+            pieces.append(piece)
+
+    merged: list[str] = []
+    for piece in pieces:
+        if (
+            merged
+            and len(merged[-1]) < min_chars
+            and len(merged[-1]) + len(piece) + 1 <= max_chars
+        ):
+            merged[-1] = f"{merged[-1]} {piece}"
+        else:
+            merged.append(piece)
+    return merged
+
+
+# id -> {"params": ..., "segments": [...], "audio": bytes | None, ...}
+_JOBS: dict[str, dict] = {}
+
+
+def _prune_jobs() -> None:
+    now = time.time()
+    for job_id in [k for k, v in _JOBS.items() if now - v["created"] > JOB_TTL_SECONDS]:
+        _JOBS.pop(job_id, None)
+    while len(_JOBS) > JOB_LIMIT:
+        _JOBS.pop(min(_JOBS, key=lambda k: _JOBS[k]["created"]), None)
+
+
 STREAM_PATH = "/v1/audio/speech/stream"
 
 
@@ -289,6 +409,163 @@ async def speak(req: SpeakRequest):
         audio,
         media_type="audio/wav",
         headers={"X-Generation-Seconds": f"{elapsed:.2f}"},
+    )
+
+
+# --------------------------------------------------------------------------
+# Progressive synthesis: split the text, synthesise segment by segment and
+# emit each one the moment it is ready, so playback starts on the first
+# sentence instead of after the whole passage.
+# --------------------------------------------------------------------------
+
+
+class SegmentRequest(BaseModel):
+    text: str = Field(min_length=1)
+    min_chars: int = SEGMENT_MIN_CHARS
+    max_chars: int = SEGMENT_MAX_CHARS
+
+
+@app.post("/api/segment")
+async def segment(req: SegmentRequest):
+    """Preview the split without synthesising anything."""
+    segments = split_text(req.text, req.min_chars, req.max_chars)
+    return {"count": len(segments), "segments": segments}
+
+
+@app.post("/api/speak/prepare")
+async def prepare(req: SpeakRequest):
+    if req.engine not in ENGINES:
+        raise HTTPException(400, f"Unknown engine: {req.engine}")
+    segments = split_text(req.text)
+    if not segments:
+        raise HTTPException(400, "Nothing to say")
+    _prune_jobs()
+    job_id = uuid.uuid4().hex
+    _JOBS[job_id] = {
+        "params": req,
+        "segments": segments,
+        "audio": None,
+        "created": time.time(),
+    }
+    return {"id": job_id, "count": len(segments), "segments": segments}
+
+
+async def _segment_chunks(
+    client: httpx.AsyncClient, cfg: dict, req: SpeakRequest, text: str, native: bool
+):
+    """Yield ("fmt", (rate, channels, width)) once, then ("pcm", bytes).
+
+    With `native` the engine's own streaming endpoint is relayed as it
+    produces audio, so the first sound of a segment arrives long before the
+    segment is finished. Without it we fall back to one complete request.
+    """
+    body = _payload(req.engine, req.model_copy(update={"text": text}))
+
+    if not native:
+        response = await client.post(cfg["url"] + "/v1/audio/speech", json=body)
+        response.raise_for_status()
+        rate, channels, width, pcm = _decode_wav(response.content)
+        yield "fmt", (rate, channels, width)
+        yield "pcm", pcm
+        return
+
+    async with client.stream("POST", cfg["url"] + STREAM_PATH, json=body) as response:
+        response.raise_for_status()
+        buffer = bytearray()
+        header = None
+        async for chunk in response.aiter_bytes():
+            if header is not None:
+                yield "pcm", chunk
+                continue
+            buffer.extend(chunk)
+            header = _parse_wav_header(bytes(buffer))
+            if header is None:
+                continue
+            rate, channels, width, offset = header
+            yield "fmt", (rate, channels, width)
+            if len(buffer) > offset:
+                yield "pcm", bytes(buffer[offset:])
+            buffer.clear()
+
+
+@app.get("/api/speak/stream/{job_id}")
+async def speak_stream(job_id: str):
+    """Chunked WAV whose bytes appear as each segment finishes.
+
+    Point an <audio> element straight at this URL: the browser plays what has
+    arrived instead of waiting for a Content-Length it will never get.
+    """
+    job = _JOBS.get(job_id)
+    if job is None:
+        raise HTTPException(404, "Unknown or expired job")
+    req: SpeakRequest = job["params"]
+    cfg = ENGINES[req.engine]
+
+    async def produce():
+        collected = bytearray()
+        header_sent = False
+        gap = b""
+        started = time.perf_counter()
+        async with httpx.AsyncClient(timeout=TIMEOUT) as client:
+            for index, text in enumerate(job["segments"]):
+                try:
+                    rate, channels, width, pcm = await _synthesise_segment(
+                        client, cfg, req, text
+                    )
+                except Exception as exc:
+                    log.error("Segment %d failed: %s", index, exc)
+                    # Mid-stream there is no way to signal an error to the
+                    # audio element, so stop cleanly with what we have.
+                    break
+                if not header_sent:
+                    header = _open_wav_header(rate, channels, width)
+                    gap = b"\0" * (rate * channels * width * SEGMENT_GAP_MS // 1000)
+                    job["sample_rate"] = rate
+                    job["channels"] = channels
+                    job["width"] = width
+                    header_sent = True
+                    yield header
+                chunk = pcm if index == 0 else gap + pcm
+                collected.extend(chunk)
+                log.info(
+                    "segment %d/%d ready at %.2fs (%d chars)",
+                    index + 1,
+                    len(job["segments"]),
+                    time.perf_counter() - started,
+                    len(text),
+                )
+                yield chunk
+        job["audio"] = bytes(collected)
+
+    return StreamingResponse(
+        produce(),
+        media_type="audio/wav",
+        headers={"Cache-Control": "no-store", "X-Segments": str(len(job["segments"]))},
+    )
+
+
+@app.get("/api/speak/file/{job_id}")
+async def speak_file(job_id: str):
+    """The finished audio as a proper WAV, once the stream has run.
+
+    The streamed response carries placeholder RIFF sizes by necessity; this
+    serves the same audio with real ones, which is what you want to download.
+    """
+    job = _JOBS.get(job_id)
+    if job is None:
+        raise HTTPException(404, "Unknown or expired job")
+    if not job.get("audio"):
+        raise HTTPException(409, "Still generating — try again when playback ends")
+    buf = io.BytesIO()
+    with wave.open(buf, "wb") as out:
+        out.setnchannels(job.get("channels", 1))
+        out.setsampwidth(job.get("width", 2))
+        out.setframerate(job.get("sample_rate", 24000))
+        out.writeframes(job["audio"])
+    return Response(
+        buf.getvalue(),
+        media_type="audio/wav",
+        headers={"Content-Disposition": f'attachment; filename="tts-{job_id[:8]}.wav"'},
     )
 
 
