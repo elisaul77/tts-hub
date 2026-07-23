@@ -466,9 +466,16 @@
     box-shadow: 0 6px 18px rgba(124,107,245,.28);
   }
   .msg.bot {
-    align-self: flex-start; background: var(--surface-2); color: var(--text);
+    align-self: flex-start; color: var(--text);
+    background: var(--surface-3); border-color: var(--line-2);
     border-bottom-left-radius: 5px;
+    box-shadow: var(--shadow-sm);
   }
+  .msg.bot::before {
+    content: ""; position: absolute; left: 0; top: 12px; bottom: 12px;
+    width: 3px; border-radius: 3px; background: var(--grad-signal);
+  }
+  .msg.bot { padding-left: 18px; }
   @keyframes rise { from { opacity: 0; transform: translateY(8px); } to { opacity: 1; transform: none; } }
   #chatPlayer { margin-top: 18px; }
 
