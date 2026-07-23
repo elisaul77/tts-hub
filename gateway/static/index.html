@@ -165,7 +165,7 @@
           <option value="1.5">1.5×</option>
         </select>
       </div>
-      <label class="check"><input type="checkbox" id="stream"> Streaming</label>
+      <label class="check"><input type="checkbox" id="stream" checked> Progresiva</label>
     </div>
   </div>
 </div>
@@ -230,8 +230,8 @@ function renderVoices() {
   if (es) sel.value = es.id;
 
   $('speedWrap').style.display = eng.id === 'kokoro' ? '' : 'none';
-  $('stream').disabled = !eng.streaming;
-  if (!eng.streaming) $('stream').checked = false;
+  // Progressive playback works for every engine: the backend falls back to
+  // whole-segment requests when an engine has no native streaming endpoint.
 }
 
 async function loadEngines() {
@@ -264,27 +264,90 @@ async function synthesize(text, useStream) {
   return res.blob();
 }
 
+// Listener attached to the `ended` event of #player while a progressive job
+// is in flight. Tracked separately so a new generation can detach it before
+// attaching its own, and so it never touches `lastUrl` (that variable is
+// reserved for the blob-URL revoke discipline used by the non-progressive
+// path and the chat tab).
+let progressiveEndedHandler = null;
+
+function clearProgressiveEnded() {
+  if (progressiveEndedHandler) {
+    $('player').removeEventListener('ended', progressiveEndedHandler);
+    progressiveEndedHandler = null;
+  }
+}
+
+// Progressive path: never buffers the response. `<audio>.src` is pointed
+// straight at the streaming endpoint so playback starts on the first
+// synthesised sentence instead of waiting for the whole text.
+async function generateProgressive(text) {
+  const player = $('player');
+  const res = await fetch('/api/speak/prepare', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({
+      engine: selected, text, voice: $('voice').value,
+      speed: parseFloat($('speed').value),
+    }),
+  });
+  if (!res.ok) throw new Error((await res.text()).slice(0, 300));
+  const { id, count } = await res.json();
+  const plural = count === 1 ? 'fragmento' : 'fragmentos';
+
+  player.src = `/api/speak/stream/${id}`;
+  player.play().catch(() => {});
+  setStatus($('status'), `Reproduciendo — ${count} ${plural}`);
+
+  progressiveEndedHandler = async () => {
+    const fileUrl = `/api/speak/file/${id}`;
+    let assembled = true;
+    try {
+      const check = await fetch(fileUrl, { method: 'HEAD' });
+      assembled = check.status !== 409;
+    } catch (err) {
+      assembled = false;
+    }
+    if (!assembled) {
+      return setStatus($('status'),
+        `Reproducción completa — ${count} ${plural}. El audio aún no está listo para descargar, prueba de nuevo en un momento.`, true);
+    }
+    setStatus($('status'), `Reproducción completa — ${count} ${plural} · `);
+    const a = document.createElement('a');
+    a.className = 'dl'; a.href = fileUrl;
+    a.download = `tts-${selected}-${Date.now()}.wav`;
+    a.textContent = 'descargar .wav';
+    $('status').appendChild(a);
+  };
+  player.addEventListener('ended', progressiveEndedHandler, { once: true });
+}
+
 async function generate() {
   const text = $('text').value.trim();
   if (!text) return setStatus($('status'), 'Escribe algo primero.', true);
   if (!selected) return setStatus($('status'), 'No hay ningún motor disponible.', true);
 
+  clearProgressiveEnded();
   $('go').disabled = true;
   const t0 = performance.now();
   setStatus($('status'), 'Generando…');
   try {
-    const blob = await synthesize(text, $('stream').checked);
-    if (lastUrl) URL.revokeObjectURL(lastUrl);
-    lastUrl = URL.createObjectURL(blob);
-    $('player').src = lastUrl;
-    $('player').play().catch(() => {});
-    const secs = ((performance.now() - t0) / 1000).toFixed(2);
-    setStatus($('status'), `Listo en ${secs} s · ${(blob.size / 1024).toFixed(0)} KB · `);
-    const a = document.createElement('a');
-    a.className = 'dl'; a.href = lastUrl;
-    a.download = `tts-${selected}-${Date.now()}.wav`;
-    a.textContent = 'descargar .wav';
-    $('status').appendChild(a);
+    if ($('stream').checked) {
+      await generateProgressive(text);
+    } else {
+      const blob = await synthesize(text, false);
+      if (lastUrl) URL.revokeObjectURL(lastUrl);
+      lastUrl = URL.createObjectURL(blob);
+      $('player').src = lastUrl;
+      $('player').play().catch(() => {});
+      const secs = ((performance.now() - t0) / 1000).toFixed(2);
+      setStatus($('status'), `Listo en ${secs} s · ${(blob.size / 1024).toFixed(0)} KB · `);
+      const a = document.createElement('a');
+      a.className = 'dl'; a.href = lastUrl;
+      a.download = `tts-${selected}-${Date.now()}.wav`;
+      a.textContent = 'descargar .wav';
+      $('status').appendChild(a);
+    }
   } catch (err) {
     setStatus($('status'), 'Error: ' + err.message, true);
   } finally {

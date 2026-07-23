@@ -74,12 +74,39 @@ CHATTERBOX_DEVICE=cpu
 - **Selector de voz** que se repuebla al cambiar de motor y **preselecciona la
   voz española** si el motor tiene una.
 - **Velocidad** (solo Kokoro, el único que la expone).
-- **Streaming**: el audio empieza a sonar antes de terminar de generarse. La
-  casilla se activa sola en los motores que lo soportan — el gateway lo
-  averigua leyendo el `openapi.json` de cada uno, así que acierta aunque
-  cambies de versión de imagen. Hoy: PocketTTS sí; Kokoro no; Chatterbox
-  depende del tag (el `gpu` actual, no).
-- Reproductor con descarga del `.wav` y el tiempo real de generación.
+- **Detección de streaming nativo**: el gateway mira el `openapi.json` de cada
+  motor para saber si tiene streaming propio, así acierta aunque cambies de
+  versión de imagen (hoy: PocketTTS sí; Kokoro y el Chatterbox `gpu` actual,
+  no). Eso decide, de forma invisible para ti, si la reproducción progresiva
+  (ver abajo) retransmite ese streaming trozo a trozo o cae a una petición
+  por segmento — ya no es algo que actives con una casilla.
+- Reproductor con descarga del `.wav`. En modo normal se ve el tiempo real de
+  generación al terminar; en progresiva, el enlace de descarga aparece
+  cuando termina de sonar el audio (detalle abajo).
+
+### Reproducción progresiva
+
+La casilla **«Progresiva»** parte el texto en frases y sintetiza segmento a
+segmento, de modo que el audio empieza a sonar en cuanto el primer trozo está
+listo, en vez de esperar a que se genere el texto completo. Está marcada por
+defecto y funciona con cualquier motor en línea: el que tiene streaming
+nativo (hoy, PocketTTS) entrega cada trozo de audio según se va generando; el
+resto recibe una petición por segmento, que sigue siendo mucho más rápida que
+esperar el texto entero de una vez.
+
+Medido con un párrafo en español de 851 caracteres (6 segmentos):
+
+| Motor | Modo | Primer audio | Duración total |
+|---|---|---|---|
+| PocketTTS | normal | 18,6 s | 48,2 s |
+| PocketTTS | progresiva | 0,24 s | 53,6 s |
+| Kokoro | normal | 17,0 s | 49,0 s |
+| Kokoro | progresiva | 1,9 s | 49,8 s |
+
+PocketTTS empieza a sonar 77 veces antes; Kokoro, 9 veces antes.
+
+El enlace de descarga aparece cuando termina la reproducción: mientras el
+audio suena, el servidor todavía está ensamblando el archivo completo.
 
 ---
 
@@ -148,7 +175,7 @@ curl -X POST http://localhost:8600/api/speak \
   -d '{"engine":"pocket","text":"Hola desde la terminal","voice":"lola"}' \
   --output salida.wav
 
-# En streaming (PocketTTS y Chatterbox)
+# En streaming (hoy solo PocketTTS tiene streaming nativo)
 curl -X POST http://localhost:8600/api/speak \
   -H "Content-Type: application/json" \
   -d '{"engine":"pocket","text":"Esto suena mientras se genera","stream":true}' \
@@ -163,7 +190,41 @@ Campos de `/api/speak`:
 | `text` | string | — | obligatorio |
 | `voice` | string | voz por defecto del motor | ver `/api/engines` |
 | `speed` | float | `1.0` | solo Kokoro |
-| `stream` | bool | `false` | se ignora si el motor no lo soporta |
+| `stream` | bool | `false` | se ignora si el motor no lo soporta (hoy solo PocketTTS) |
+
+### Endpoints de la reproducción progresiva
+
+Los cuatro endpoints que usa la casilla «Progresiva» de la interfaz también
+están disponibles sueltos:
+
+```bash
+# Previsualizar cómo se partiría el texto, sin sintetizar nada — útil para
+# ajustar SEGMENT_MIN_CHARS / SEGMENT_MAX_CHARS
+curl -X POST http://localhost:8600/api/segment \
+  -H "Content-Type: application/json" \
+  -d '{"text":"Primera frase. Segunda frase."}'
+# → {"count":2,"segments":["Primera frase.","Segunda frase."]}
+
+# Registrar un trabajo (mismo cuerpo que /api/speak)
+curl -X POST http://localhost:8600/api/speak/prepare \
+  -H "Content-Type: application/json" \
+  -d '{"engine":"pocket","text":"Hola desde la terminal","voice":"lola"}'
+# → {"id":"...","count":1,"segments":["Hola desde la terminal"]}
+
+# Reproducirlo mientras se va generando (.wav troceado)
+curl http://localhost:8600/api/speak/stream/<id> --output salida.wav
+
+# El archivo ya ensamblado, para descargar
+curl http://localhost:8600/api/speak/file/<id> --output salida.wav
+```
+
+`/api/speak/stream/{id}` escribe la cabecera RIFF con tamaños en blanco
+(`0xFFFFFFFF`) a propósito, porque la duración no se conoce hasta que termina
+de generarse — algunos reproductores no mostrarán duración ni dejarán buscar
+dentro del audio mientras lo consumes así. `/api/speak/file/{id}` sí trae los
+tamaños correctos, pero responde 409 si el streaming todavía no ha terminado.
+Los trabajos caducan a los 30 minutos o en cuanto existen 20 más nuevos que
+ellos.
 
 Y para el bucle conversacional:
 

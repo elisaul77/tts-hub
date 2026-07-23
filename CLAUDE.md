@@ -28,7 +28,8 @@ UI at <http://localhost:8600>.
 
 ## Current state
 
-Progressive (segment-by-segment) synthesis is mid-refactor and **the gateway
-does not start**: `produce()` in `speak_stream` still calls the removed
-`_synthesise_segment()` instead of the new `_segment_chunks()` generator, and
-the UI still buffers the whole response with `await res.blob()`.
+Progressive (segment-by-segment) synthesis is shipped and measured: PocketTTS
+starts playback ~77× sooner, Kokoro ~9× sooner than the non-progressive path
+(see AGENTS.md for the numbers and endpoints). One issue remains open — a
+disconnect-safety bug in `engines/pocket/server.py`'s streaming lock. A
+PocketTTS duration overshoot was also found, but is diagnosed and accepted.

@@ -507,26 +507,61 @@ async def speak_stream(job_id: str):
         gap = b""
         started = time.perf_counter()
         async with httpx.AsyncClient(timeout=TIMEOUT) as client:
+            # Resolved once for the whole job: probing per segment would add
+            # a round trip before every sentence for no benefit, since the
+            # engine's capabilities don't change mid-job.
+            native = await _supports_streaming(client, cfg["url"], cfg["streaming"])
             for index, text in enumerate(job["segments"]):
+                first_pcm = True
                 try:
-                    rate, channels, width, pcm = await _synthesise_segment(
-                        client, cfg, req, text
-                    )
+                    async for kind, payload in _segment_chunks(
+                        client, cfg, req, text, native
+                    ):
+                        if kind == "fmt":
+                            rate, channels, width = payload
+                            if not header_sent:
+                                gap = b"\0" * (
+                                    rate * channels * width * SEGMENT_GAP_MS // 1000
+                                )
+                                job["sample_rate"] = rate
+                                job["channels"] = channels
+                                job["width"] = width
+                                header_sent = True
+                                # A browser can only accept one RIFF header per
+                                # stream, so only the very first segment's fmt
+                                # gets to open it; later ones are just checked.
+                                yield _open_wav_header(rate, channels, width)
+                            elif (rate, channels, width) != (
+                                job["sample_rate"],
+                                job["channels"],
+                                job["width"],
+                            ):
+                                log.warning(
+                                    "segment %d reports %s, stream already "
+                                    "committed to %s — ignoring",
+                                    index,
+                                    (rate, channels, width),
+                                    (
+                                        job["sample_rate"],
+                                        job["channels"],
+                                        job["width"],
+                                    ),
+                                )
+                            continue
+                        # kind == "pcm": forward immediately so native
+                        # streaming's time-to-first-byte isn't thrown away by
+                        # buffering a whole segment before yielding it.
+                        chunk = payload
+                        if index > 0 and first_pcm:
+                            chunk = gap + chunk
+                        first_pcm = False
+                        collected.extend(chunk)
+                        yield chunk
                 except Exception as exc:
                     log.error("Segment %d failed: %s", index, exc)
                     # Mid-stream there is no way to signal an error to the
                     # audio element, so stop cleanly with what we have.
                     break
-                if not header_sent:
-                    header = _open_wav_header(rate, channels, width)
-                    gap = b"\0" * (rate * channels * width * SEGMENT_GAP_MS // 1000)
-                    job["sample_rate"] = rate
-                    job["channels"] = channels
-                    job["width"] = width
-                    header_sent = True
-                    yield header
-                chunk = pcm if index == 0 else gap + pcm
-                collected.extend(chunk)
                 log.info(
                     "segment %d/%d ready at %.2fs (%d chars)",
                     index + 1,
@@ -534,7 +569,6 @@ async def speak_stream(job_id: str):
                     time.perf_counter() - started,
                     len(text),
                 )
-                yield chunk
         job["audio"] = bytes(collected)
 
     return StreamingResponse(

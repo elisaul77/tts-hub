@@ -1,6 +1,6 @@
 ---
 orchestration-stack: "subagent-pool v8.1 · arquitec-dev-ia v5.0"
-documented-at: "2026-07-23T06:40:00Z"
+documented-at: "2026-07-23T13:30:14Z"
 graphify-graph: "missing"
 graphify-nodes: 0
 graphify-communities: 0
@@ -25,9 +25,15 @@ loop by bridging microphone → Whisper → any OpenAI-compatible LLM on the hos
 repo; two are pinned third-party images. Nothing calls out to the network at
 runtime except to reach the host's LLM server.
 
+Progressive (segment-by-segment) synthesis ships alongside the original
+one-shot path: `POST /api/segment` (preview split), `POST /api/speak/prepare`
+(register a job), `GET /api/speak/stream/{job_id}` (chunked WAV, plays as it
+generates) and `GET /api/speak/file/{job_id}` (assembled download). See
+"Recent Work" below for details and open issues.
+
 ## God Nodes (High-Risk Files)
 
-- `gateway/main.py` — ~737 lines, ~35 functions — every HTTP route, all four
+- `gateway/main.py` — ~772 lines, ~35 functions — every HTTP route, all four
   engine adapters, all WAV manipulation and the LLM bridge. Changes impact:
   every service, the UI, and all external API consumers.
 - `docker-compose.yml` — ~129 lines — wires all 5 services, ports, env vars,
@@ -60,22 +66,46 @@ runtime except to reach the host's LLM server.
 5. The gateway holds no conversation state. Chat history lives in the browser.
    Only `_JOBS` is server state, TTL-pruned at 1800 s / 20 entries.
 
-## Known Broken State (as of documented-at)
+## Recent Work (as of documented-at)
 
-Progressive segment-by-segment synthesis is mid-refactor; **the gateway does
-not currently start**:
+Progressive segment-by-segment synthesis is implemented, reviewed and
+measured. `split_text()` cuts on sentence boundaries, merges short pieces,
+hard-splits long ones, and a `SEGMENT_GAP_MS` silence is inserted between
+segments. The UI's "Progresiva" checkbox (default checked) points `<audio>`
+straight at `GET /api/speak/stream/{job_id}` — no blob buffering — and falls
+back to one full request per segment for engines without native streaming.
+`/api/speak` is unchanged and still backs the conversation tab.
 
-- `produce()` inside `speak_stream` (~line 512) calls `_synthesise_segment()`,
-  which was replaced by the async generator `_segment_chunks()` (~line 453).
-- `gateway/static/index.html` has not been updated: `generate()` still does
-  `await res.blob()`, so nothing plays progressively — not even PocketTTS,
-  which has a native streaming endpoint.
-- New, untested surface: `/api/segment`, `/api/speak/prepare`,
-  `/api/speak/stream/{id}`, `/api/speak/file/{id}`, `split_text`,
-  `_parse_wav_header`, `_open_wav_header`, `_decode_wav`, `_JOBS`.
+Measured on an 851-char Spanish paragraph (6 segments): PocketTTS reaches
+first audio in 0.243 s progressive vs 18.63 s baseline (76.7× sooner); Kokoro
+in 1.857 s vs 17.02 s (9.2× sooner). Full table and the curl-caveat about
+`time_starttransfer` being invalid for this measurement live in AGENTS.md.
 
-Finishing this is the active task. Do not treat `gateway/main.py` as a working
-baseline.
+One issue is open, not resolved:
+
+1. **MAJOR** — `engines/pocket/server.py`'s `/v1/audio/speech/stream` holds a
+   `threading.Lock` across a sync generator; a client disconnect does not
+   stop generation, so it stalls subsequent requests. Fires under normal
+   progressive-playback use (user hits generate again mid-stream).
+
+One is diagnosed and closed as accepted-by-design (not a bug):
+
+- **PocketTTS progressive duration overshoot (+11.2%)** — traced to
+  `pocket_tts`'s internal `split_into_best_sentences()` packer
+  (`MAX_TOKEN_PER_CHUNK=50`, unrelated to the gateway's `SEGMENT_MAX_CHARS`),
+  which pays ~240-850 ms of stochastic trailing silence-after-EOS per
+  internal chunk; splitting text into more HTTP calls restarts that packer
+  more times. Isolated measurement (no gateway involved): one call over a
+  418-char text averaged 27.3 s vs 29.5 s as 4 independent calls. Both
+  available fixes were rejected as unsafe (risk of clipping real audio, or
+  reintroducing the buffering the streaming feature exists to avoid). Full
+  diagnosis and the one deliberately-out-of-scope future option live in
+  AGENTS.md.
+
+Do not repeat the earlier "the gateway does not start" claim: that was never
+an import-time failure — `_synthesise_segment` was a `NameError` raised only
+when `GET /api/speak/stream/{job_id}` was called; uvicorn booted fine and
+every other route worked throughout.
 
 ## Components Documented
 
