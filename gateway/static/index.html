@@ -1,0 +1,245 @@
+<!doctype html>
+<html lang="es">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>TTS Hub — texto a voz local</title>
+<style>
+  :root {
+    --bg: #0e1116;
+    --panel: #161b22;
+    --panel-2: #1c232c;
+    --border: #2b3441;
+    --text: #e6edf3;
+    --muted: #8b98a5;
+    --accent: #4c9aff;
+    --accent-soft: rgba(76, 154, 255, .14);
+    --ok: #3fb950;
+    --off: #6e7681;
+    --err: #f85149;
+  }
+  @media (prefers-color-scheme: light) {
+    :root {
+      --bg: #f4f6f8; --panel: #fff; --panel-2: #f0f3f6; --border: #d7dee6;
+      --text: #1a1f26; --muted: #5e6b7a; --accent-soft: rgba(76,154,255,.12);
+    }
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0; padding: 2rem 1rem 4rem;
+    font: 15px/1.55 system-ui, -apple-system, "Segoe UI", sans-serif;
+    background: var(--bg); color: var(--text);
+  }
+  .wrap { max-width: 860px; margin: 0 auto; }
+  header { margin-bottom: 1.75rem; }
+  h1 { margin: 0 0 .3rem; font-size: 1.6rem; letter-spacing: -.02em; }
+  .sub { color: var(--muted); font-size: .9rem; }
+  .card {
+    background: var(--panel); border: 1px solid var(--border);
+    border-radius: 12px; padding: 1.25rem; margin-bottom: 1.25rem;
+  }
+  label.field { display: block; font-size: .8rem; text-transform: uppercase;
+    letter-spacing: .06em; color: var(--muted); margin-bottom: .5rem; }
+  textarea {
+    width: 100%; min-height: 150px; resize: vertical; padding: .85rem;
+    font: inherit; color: var(--text); background: var(--panel-2);
+    border: 1px solid var(--border); border-radius: 8px;
+  }
+  textarea:focus, select:focus, button:focus-visible {
+    outline: 2px solid var(--accent); outline-offset: 1px;
+  }
+  .engines { display: grid; gap: .75rem; grid-template-columns: repeat(auto-fit, minmax(210px, 1fr)); }
+  .engine {
+    position: relative; text-align: left; cursor: pointer; padding: .9rem;
+    background: var(--panel-2); border: 1px solid var(--border);
+    border-radius: 10px; color: inherit; font: inherit; transition: border-color .15s, background .15s;
+  }
+  .engine:hover:not(:disabled) { border-color: var(--accent); }
+  .engine[aria-pressed="true"] { border-color: var(--accent); background: var(--accent-soft); }
+  .engine:disabled { opacity: .5; cursor: not-allowed; }
+  .engine .name { font-weight: 600; display: flex; align-items: center; gap: .4rem; }
+  .engine .tag { font-size: .75rem; color: var(--muted); margin: .15rem 0 .4rem; }
+  .engine .desc { font-size: .8rem; color: var(--muted); }
+  .dot { width: 8px; height: 8px; border-radius: 50%; background: var(--off); flex: none; }
+  .dot.online { background: var(--ok); }
+  .dot.offline { background: var(--off); }
+  .row { display: flex; flex-wrap: wrap; gap: 1rem; align-items: flex-end; margin-top: 1rem; }
+  .row > div { flex: 1 1 160px; }
+  select {
+    width: 100%; padding: .55rem; font: inherit; color: var(--text);
+    background: var(--panel-2); border: 1px solid var(--border); border-radius: 8px;
+  }
+  .check { display: flex; align-items: center; gap: .45rem; flex: 0 0 auto; padding-bottom: .55rem; }
+  button.go {
+    padding: .7rem 1.5rem; font: inherit; font-weight: 600; cursor: pointer;
+    color: #fff; background: var(--accent); border: 0; border-radius: 8px;
+  }
+  button.go:disabled { opacity: .55; cursor: progress; }
+  audio { width: 100%; margin-top: 1rem; }
+  .status { margin-top: .9rem; font-size: .85rem; color: var(--muted); min-height: 1.2em; }
+  .status.error { color: var(--err); }
+  a.dl { color: var(--accent); font-size: .85rem; }
+</style>
+</head>
+<body>
+<div class="wrap">
+  <header>
+    <h1>TTS Hub</h1>
+    <div class="sub">Texto a voz 100 % local — PocketTTS · Kokoro · Chatterbox</div>
+  </header>
+
+  <div class="card">
+    <label class="field" for="text">Texto</label>
+    <textarea id="text" placeholder="Escribe aquí lo que quieres escuchar…">Hola, esto es una prueba de voz generada completamente en local, sin conexión a internet.</textarea>
+  </div>
+
+  <div class="card">
+    <label class="field">Motor</label>
+    <div class="engines" id="engines"></div>
+
+    <div class="row">
+      <div>
+        <label class="field" for="voice">Voz</label>
+        <select id="voice"></select>
+      </div>
+      <div id="speedWrap">
+        <label class="field" for="speed">Velocidad</label>
+        <select id="speed">
+          <option value="0.75">0.75×</option>
+          <option value="1" selected>1×</option>
+          <option value="1.25">1.25×</option>
+          <option value="1.5">1.5×</option>
+        </select>
+      </div>
+      <label class="check"><input type="checkbox" id="stream"> Streaming</label>
+      <div style="flex:0 0 auto">
+        <button class="go" id="go">Generar voz</button>
+      </div>
+    </div>
+
+    <audio id="player" controls></audio>
+    <div class="status" id="status"></div>
+  </div>
+</div>
+
+<script>
+const $ = (id) => document.getElementById(id);
+let engines = [];
+let selected = null;
+let lastUrl = null;
+
+function setStatus(msg, isError = false) {
+  const el = $('status');
+  el.textContent = msg;
+  el.classList.toggle('error', isError);
+}
+
+function renderEngines() {
+  const box = $('engines');
+  box.innerHTML = '';
+  for (const eng of engines) {
+    const btn = document.createElement('button');
+    btn.className = 'engine';
+    btn.type = 'button';
+    btn.disabled = eng.status !== 'online';
+    btn.setAttribute('aria-pressed', String(eng.id === selected));
+    btn.innerHTML = `
+      <div class="name"><span class="dot ${eng.status}"></span>${eng.name}</div>
+      <div class="tag">${eng.tagline}</div>
+      <div class="desc">${eng.status === 'online' ? eng.description : 'No disponible'}</div>`;
+    btn.onclick = () => { selected = eng.id; renderEngines(); renderVoices(); };
+    box.appendChild(btn);
+  }
+}
+
+function renderVoices() {
+  const eng = engines.find((e) => e.id === selected);
+  const sel = $('voice');
+  sel.innerHTML = '';
+  if (!eng) return;
+  for (const v of eng.voices) {
+    const opt = document.createElement('option');
+    opt.value = v.id;
+    opt.textContent = v.language && v.language !== 'auto' ? `${v.id}  (${v.language})` : v.id;
+    sel.appendChild(opt);
+  }
+  // Prefer a Spanish voice when the engine offers one.
+  const es = eng.voices.find((v) => v.language === 'es');
+  if (es) sel.value = es.id;
+
+  $('speedWrap').style.display = eng.id === 'kokoro' ? '' : 'none';
+  $('stream').disabled = !eng.streaming;
+  if (!eng.streaming) $('stream').checked = false;
+}
+
+async function loadEngines() {
+  setStatus('Consultando motores…');
+  try {
+    engines = await (await fetch('/api/engines')).json();
+  } catch (err) {
+    setStatus('No se pudo contactar con el gateway: ' + err, true);
+    return;
+  }
+  const online = engines.find((e) => e.status === 'online');
+  selected = online ? online.id : null;
+  renderEngines();
+  renderVoices();
+  const n = engines.filter((e) => e.status === 'online').length;
+  setStatus(n ? `${n} de ${engines.length} motores listos.` :
+    'Ningún motor responde todavía — puede seguir descargando modelos.', !n);
+}
+
+async function generate() {
+  const text = $('text').value.trim();
+  if (!text) return setStatus('Escribe algo primero.', true);
+  if (!selected) return setStatus('No hay ningún motor disponible.', true);
+
+  const btn = $('go');
+  btn.disabled = true;
+  const t0 = performance.now();
+  setStatus('Generando…');
+
+  try {
+    const res = await fetch('/api/speak', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        engine: selected,
+        text,
+        voice: $('voice').value,
+        speed: parseFloat($('speed').value),
+        stream: $('stream').checked,
+      }),
+    });
+    if (!res.ok) throw new Error((await res.text()).slice(0, 300));
+
+    const blob = await res.blob();
+    if (lastUrl) URL.revokeObjectURL(lastUrl);
+    lastUrl = URL.createObjectURL(blob);
+    $('player').src = lastUrl;
+    $('player').play().catch(() => {});
+
+    const secs = ((performance.now() - t0) / 1000).toFixed(2);
+    const kb = (blob.size / 1024).toFixed(0);
+    setStatus(`Listo en ${secs} s · ${kb} KB · `);
+    const a = document.createElement('a');
+    a.className = 'dl';
+    a.href = lastUrl;
+    a.download = `tts-${selected}-${Date.now()}.wav`;
+    a.textContent = 'descargar .wav';
+    $('status').appendChild(a);
+  } catch (err) {
+    setStatus('Error: ' + err.message, true);
+  } finally {
+    btn.disabled = false;
+  }
+}
+
+$('go').onclick = generate;
+$('text').addEventListener('keydown', (e) => {
+  if ((e.ctrlKey || e.metaKey) && e.key === 'Enter') generate();
+});
+loadEngines();
+</script>
+</body>
+</html>

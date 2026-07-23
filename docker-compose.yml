@@ -1,0 +1,87 @@
+name: tts-hub
+
+services:
+  # ---------------------------------------------------------------------
+  # Web UI + router. The only service you actually need to open.
+  # ---------------------------------------------------------------------
+  gateway:
+    build: ./gateway
+    container_name: tts-hub-gateway
+    ports:
+      - "${GATEWAY_PORT:-8600}:8000"
+    environment:
+      POCKET_URL: http://pocket:8000
+      KOKORO_URL: http://kokoro:8880
+      CHATTERBOX_URL: http://chatterbox:4123
+    restart: unless-stopped
+
+  # ---------------------------------------------------------------------
+  # PocketTTS — Kyutai, 100M params, CPU only, native Spanish, streaming.
+  # ---------------------------------------------------------------------
+  pocket:
+    build: ./engines/pocket
+    container_name: tts-hub-pocket
+    ports:
+      - "${POCKET_PORT:-8601}:8000"
+    environment:
+      POCKET_LANGUAGE: ${POCKET_LANGUAGE:-spanish}
+      POCKET_VOICE: ${POCKET_VOICE:-lola}
+      POCKET_QUANTIZE: ${POCKET_QUANTIZE:-false}
+      OMP_NUM_THREADS: ${POCKET_THREADS:-4}
+    volumes:
+      - pocket-cache:/cache
+    healthcheck:
+      test: ["CMD", "curl", "-fs", "http://localhost:8000/health"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 300s
+    restart: unless-stopped
+
+  # ---------------------------------------------------------------------
+  # Kokoro — 82M params, 54 voices across 8 languages. CPU by default so it
+  # does not compete with Chatterbox for the GPU.
+  # ---------------------------------------------------------------------
+  kokoro:
+    image: ghcr.io/remsky/kokoro-fastapi-cpu:latest
+    container_name: tts-hub-kokoro
+    ports:
+      - "${KOKORO_PORT:-8880}:8880"
+    restart: unless-stopped
+
+  # ---------------------------------------------------------------------
+  # Chatterbox — Resemble AI, 22 languages, voice cloning. Needs the GPU.
+  # Drop it with:  docker compose stop chatterbox
+  # ---------------------------------------------------------------------
+  chatterbox:
+    image: travisvn/chatterbox-tts-api:${CHATTERBOX_TAG:-gpu}
+    container_name: tts-hub-chatterbox
+    ports:
+      - "${CHATTERBOX_PORT:-4123}:4123"
+    environment:
+      PORT: 4123
+      HOST: 0.0.0.0
+      DEVICE: ${CHATTERBOX_DEVICE:-cuda}
+      MODEL_CACHE_DIR: /cache
+      VOICE_LIBRARY_DIR: /voices
+      EXAGGERATION: ${CHATTERBOX_EXAGGERATION:-0.5}
+      CFG_WEIGHT: ${CHATTERBOX_CFG_WEIGHT:-0.5}
+      TEMPERATURE: ${CHATTERBOX_TEMPERATURE:-0.8}
+      NVIDIA_VISIBLE_DEVICES: all
+      NVIDIA_DRIVER_CAPABILITIES: compute,utility
+    volumes:
+      - chatterbox-models:/cache
+      - chatterbox-voices:/voices
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: 1
+              capabilities: [gpu]
+    restart: unless-stopped
+
+volumes:
+  pocket-cache:
+  chatterbox-models:
+  chatterbox-voices:

@@ -1,0 +1,32 @@
+# Local configuration
+.env
+docker-compose.override.yml
+
+# Generated audio
+*.wav
+*.mp3
+*.flac
+*.ogg
+output/
+voices/
+
+# Model caches (these live in Docker volumes, but just in case)
+cache/
+models/
+.cache/
+
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+*.egg-info/
+
+# Editors / OS
+.vscode/
+.idea/
+.DS_Store
+*.swp
+
+# Logs
+*.log
